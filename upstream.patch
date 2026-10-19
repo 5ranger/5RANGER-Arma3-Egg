@@ -12,7 +12,25 @@
              elif [[ -n $(grep -i "0x202\|0x212" "${STEAMCMD_LOG}") ]]; then # Not enough disk space
                  echo -e "\n${RED}[UPDATE]: Unable to complete download - Not enough storage${NC}"
                  echo -e "\t${YELLOW}You have run out of your allotted disk space.${NC}"
-@@ -144,9 +147,16 @@
+@@ -126,6 +129,17 @@
+             if [[ $1 == 0 ]]; then # Server
+                 echo -e "\n${GREEN}[UPDATE]: Game server is up to date!${NC}"
+             else # Mod
++                # Refuse to rebuild from an empty or absent source. SteamCMD reports success when
++                # it believes an item is current, which it can do while the item's files are gone -
++                # and the rebuild below starts with "rm -rf", so an empty source would destroy the
++                # only remaining copy of a mod that may not be downloadable again.
++                if [[ ! -d "${WORKSHOP_DIR}/content/${GAME_ID}/$2" ]] || [[ -z "$(ls -A "${WORKSHOP_DIR}/content/${GAME_ID}/$2" 2>/dev/null)" ]]; then
++                    echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}SteamCMD reported success for ${CYAN}$2${NC} but downloaded no files."
++                    echo -e "\t${YELLOW}Keeping the copy already in place and leaving it untouched.${NC}"
++                    echo -e "\t(SteamCMD's records say this mod is installed while its files are missing."
++                    echo -e "\t Delete its entry from ${CYAN}${WORKSHOP_DIR}/appworkshop_${GAME_ID}.acf${NC} to force a full download.)"
++                    break
++                fi
+                 echo -e "\n\tMoving any mod ${CYAN}.bikey${NC} files to the ${CYAN}keys/${NC} folder..."
+                 if [[ $1 == 1 ]]; then # Regular mod
+                     # Move any .bikey's to the keys directory
+@@ -144,9 +158,16 @@
                          filename=$(basename ${file})
                          cp $file keys/optional_$2_${filename}
                      done;
@@ -32,7 +50,7 @@
                      # Create a directory so time-based detection of auto updates works correctly
                      mkdir -p "@${2}_optional" && touch "@${2}_optional"
                      touch "@${2}_optional/DON'T DELETE THIS DIRECTORY - USED FOR AUTO UPDATES"
-@@ -172,13 +182,12 @@
+@@ -172,13 +193,12 @@
  # Takes a directory (string) as input, and recursively makes all files & folders lowercase.
  function ModsLowercase {
      echo -e "\tMaking mod ${CYAN}$1${NC} files/folders ${CYAN}lowercase${NC}..."
@@ -51,7 +69,7 @@
  }
  
  # Removes duplicate items from a semicolon delimited string
-@@ -188,6 +197,64 @@
+@@ -188,6 +208,64 @@
      fi
  }
  
@@ -116,7 +134,7 @@
  ## === ENTRYPOINT START ===
  
  # Wait for the container to fully initialize
-@@ -256,42 +323,58 @@
+@@ -256,42 +334,58 @@
      ## Update mods
      if [[ -n $allMods ]]; then
          echo -e "\n${GREEN}[UPDATE]:${NC} Checking all ${CYAN}Steam Workshop mods${NC} for updates..."
@@ -208,7 +226,7 @@
          done
  
          # Check over key files for un-configured optional mods' .bikey files
-@@ -350,7 +433,7 @@
+@@ -350,7 +444,7 @@
  if [[ ! -f basic.cfg ]]; then
      echo -e "\n${YELLOW}[STARTUP_WARN]: Basic Network Configuration file \"${CYAN}basic.cfg${YELLOW}\" is missing!${NC}"
      echo -e "\t${YELLOW}Downloading default file for use instead...${NC}"

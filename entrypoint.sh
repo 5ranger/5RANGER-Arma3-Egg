@@ -139,6 +139,17 @@ function RunSteamCMD { #[Input: int server=0 mod=1 optional_mod=2; int id]
             if [[ $1 == 0 ]]; then # Server
                 echo -e "\n${GREEN}[UPDATE]: Game server is up to date!${NC}"
             else # Mod
+                # Refuse to rebuild from an empty or absent source. SteamCMD reports success when
+                # it believes an item is current, which it can do while the item's files are gone -
+                # and the rebuild below starts with "rm -rf", so an empty source would destroy the
+                # only remaining copy of a mod that may not be downloadable again.
+                if [[ ! -d "${WORKSHOP_DIR}/content/${GAME_ID}/$2" ]] || [[ -z "$(ls -A "${WORKSHOP_DIR}/content/${GAME_ID}/$2" 2>/dev/null)" ]]; then
+                    echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}SteamCMD reported success for ${CYAN}$2${NC} but downloaded no files."
+                    echo -e "\t${YELLOW}Keeping the copy already in place and leaving it untouched.${NC}"
+                    echo -e "\t(SteamCMD's records say this mod is installed while its files are missing."
+                    echo -e "\t Delete its entry from ${CYAN}${WORKSHOP_DIR}/appworkshop_${GAME_ID}.acf${NC} to force a full download.)"
+                    break
+                fi
                 echo -e "\n\tMoving any mod ${CYAN}.bikey${NC} files to the ${CYAN}keys/${NC} folder..."
                 if [[ $1 == 1 ]]; then # Regular mod
                     # Move any .bikey's to the keys directory
