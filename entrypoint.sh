@@ -208,7 +208,9 @@ function RemoveDuplicates { #[Input: str - Output: printf of new str]
 }
 
 # Asks the Steam Web API about every given Workshop ID, filling the modResult/modUpdated/modTitle
-# maps, 100 IDs per request. Returns non-zero if any request could not be parsed.
+# maps, 100 IDs per request. Returns non-zero if any request could not be parsed. An item the
+# API will not describe (private, unlisted or removed) comes back with result != 1 and no
+# timestamp; the caller hands those to SteamCMD rather than assuming they are gone.
 #
 # This replaces scraping one Workshop changelog web page per mod. Those pages are rate limited:
 # a server with ~130 mods trips the limit part way through its own start-up, every later page
@@ -358,17 +360,22 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
 
             modName=${modTitle[$modID]:-"[NAME UNAVAILABLE]"}
 
-            # Skip items the Workshop no longer serves, rather than retrying them on every start
+            # The public API cannot see a private or unlisted item, and reports it exactly as it
+            # reports a deleted one. Rather than skip it - which would strip a server of its own
+            # unpublished mods - let SteamCMD decide, since it is logged in and we are not.
+            modUnknown=0
             if (( apiOK == 1 )) && [[ -n ${modResult[$modID]} ]] && (( ${modResult[$modID]} != 1 )); then
-                echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Mod ${CYAN}${modID}${NC} is no longer available on the Steam Workshop. ${CYAN}Skipping...${NC}"
-                echo -e "\t(It has been removed or made private. Please take it out of your mod list.)"
-                continue
+                modUnknown=1
+                echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Mod ${CYAN}${modID}${NC} could not be looked up on the Steam Workshop."
+                echo -e "\t(It is private, unlisted, or removed. Asking SteamCMD, which is signed in, instead.)"
             fi
 
             latestUpdate=${modUpdated[$modID]:-0}
 
             if [[ ! -d $modDir ]]; then
                 echo -e "\n${GREEN}[UPDATE]:${NC} Downloading new Mod: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
+            elif (( modUnknown == 1 )); then
+                echo -e "\t${CYAN}Checking it with SteamCMD...${NC}"
             elif (( apiOK == 1 && latestUpdate > 0 )) && (( latestUpdate > $(stat -c %Y "$modDir") )); then
                 echo -e "\n${GREEN}[UPDATE]:${NC} Mod update found for: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
                 echo -e "\tMod was last updated: ${CYAN}$(date -d @${latestUpdate})${NC}"
