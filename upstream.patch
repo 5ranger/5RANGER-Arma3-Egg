@@ -1,0 +1,212 @@
+--- a/games/arma3/entrypoint.sh
++++ b/games/arma3/entrypoint.sh
+@@ -99,7 +99,10 @@
+                 echo -e "\t${YELLOW}While unknown, this error is likely due to your host's Steam account not owning the base game,${NC}"
+                 echo -e "\t${YELLOW}or the account is being rate-limited by Steam.${NC}"
+                 echo -e "\t${YELLOW}(Please contact your administrator/host if this issue persists)${NC}\n"
+-                exit 1
++                if [[ $1 == 0 ]]; then # Only fatal for the game server itself
++                    exit 1
++                fi
++                break
+             elif [[ -n $(grep -i "0x202\|0x212" "${STEAMCMD_LOG}") ]]; then # Not enough disk space
+                 echo -e "\n${RED}[UPDATE]: Unable to complete download - Not enough storage${NC}"
+                 echo -e "\t${YELLOW}You have run out of your allotted disk space.${NC}"
+@@ -144,9 +147,16 @@
+                         filename=$(basename ${file})
+                         cp $file keys/optional_$2_${filename}
+                     done;
+-                    # Delete mod folder to save space
+-                    echo -e "\tMod is an ${CYAN}optional mod${NC}. Deleting mod files to save space..."
+-                    rm -r ${WORKSHOP_DIR}/content/${GAME_ID}/$2
++                    # Delete mod folder to save space, unless the admin has asked to keep it.
++                    # Deleting it leaves the item recorded in appworkshop_<GAME_ID>.acf as installed
++                    # while its files are gone, so SteamCMD is later asked to update content it no
++                    # longer has.
++                    if [[ ${OPTIONALMODS_KEEP_FILES} == "1" ]]; then
++                        echo -e "\tMod is an ${CYAN}optional mod${NC}, but ${CYAN}OPTIONALMODS_KEEP_FILES${NC} is enabled. Keeping mod files."
++                    else
++                        echo -e "\tMod is an ${CYAN}optional mod${NC}. Deleting mod files to save space..."
++                        rm -r ${WORKSHOP_DIR}/content/${GAME_ID}/$2
++                    fi
+                     # Create a directory so time-based detection of auto updates works correctly
+                     mkdir -p "@${2}_optional" && touch "@${2}_optional"
+                     touch "@${2}_optional/DON'T DELETE THIS DIRECTORY - USED FOR AUTO UPDATES"
+@@ -172,13 +182,12 @@
+ # Takes a directory (string) as input, and recursively makes all files & folders lowercase.
+ function ModsLowercase {
+     echo -e "\tMaking mod ${CYAN}$1${NC} files/folders ${CYAN}lowercase${NC}..."
+-    for SRC in `find ./$1 -depth`; do
+-        DST=`dirname "${SRC}"`/`basename "${SRC}" | tr '[A-Z]' '[a-z]'`
+-        if [ "${SRC}" != "${DST}" ]
+-        then
+-            [ ! -e "${DST}" ] && mv -T "${SRC}" "${DST}"
++    while IFS= read -r -d '' SRC; do
++        DST="$(dirname "${SRC}")/$(basename "${SRC}" | tr '[:upper:]' '[:lower:]')"
++        if [ "${SRC}" != "${DST}" ] && [ ! -e "${DST}" ]; then
++            mv -T "${SRC}" "${DST}"
+         fi
+-    done
++    done < <(find "./$1" -depth -print0)
+ }
+ 
+ # Removes duplicate items from a semicolon delimited string
+@@ -188,6 +197,62 @@
+     fi
+ }
+ 
++# Asks the Steam Web API about every given Workshop ID, filling the modResult/modUpdated/modTitle
++# maps, 100 IDs per request. Returns non-zero if any request could not be parsed.
++#
++# This replaces scraping one Workshop changelog web page per mod. Those pages are rate limited:
++# a server with ~130 mods trips the limit part way through its own start-up, every later page
++# returns HTTP 429, the scrape then parses as an empty string, and the comparison below silently
++# treats the mod as current. The failure is invisible - no error is printed - and because each
++# start re-trips the limit, mods can stay frozen indefinitely. The Web API answers the same
++# question for every mod at once, needs no API key, and is not rate limited at this volume.
++# The reply is read with awk, which this image already has, so no new dependency is introduced.
++function FetchWorkshopDetails { #[Input: str ids (space delimited)]
++    local ids=($1)
++    local total=${#ids[@]}
++    local i=0 n chunk body got
++    while (( i < total )); do
++        chunk=""; n=0
++        while (( n < 100 && i < total )); do
++            chunk+="&publishedfileids[${n}]=${ids[$i]}"
++            n=$((n+1)); i=$((i+1))
++        done
++        body=$(curl -sS --max-time 30 --retry 2 --retry-delay 3 \
++            -X POST "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/" \
++            -d "itemcount=${n}${chunk}" 2>/dev/null)
++
++        # Each item in the response begins with its own "publishedfileid" key, so that string makes
++        # a record separator; only the three scalars this script needs are read out of each record.
++        got=0
++        while IFS=$'\t' read -r id result updated title; do
++            modResult[$id]=$result
++            modUpdated[$id]=$updated
++            modTitle[$id]=$title
++            got=$((got+1))
++        done < <(printf '%s' "${body}" | awk '
++            BEGIN { RS = "\"publishedfileid\":\"" }
++            NR > 1 {
++                id = substr($0, 1, index($0, "\"") - 1)
++                if (id !~ /^[0-9]+$/) next
++                res = "0"; upd = "0"; ttl = ""
++                if (match($0, /"result":[0-9]+/))       res = substr($0, RSTART + 9,  RLENGTH - 9)
++                if (match($0, /"time_updated":[0-9]+/)) upd = substr($0, RSTART + 15, RLENGTH - 15)
++                if (match($0, /"title":"([^"\\]|\\.)*"/)) {
++                    ttl = substr($0, RSTART + 9, RLENGTH - 10)
++                    gsub(/\\"/, "\"", ttl); gsub(/\\\\/, "\\", ttl); gsub(/\t/, " ", ttl)
++                }
++                if (ttl == "") ttl = "[NAME UNAVAILABLE]"
++                printf "%s\t%s\t%s\t%s\n", id, res, upd, ttl
++            }')
++
++        # An empty, truncated or non-JSON reply (a rate-limit or error page) yields no records
++        if (( got == 0 )); then
++            return 1
++        fi
++    done
++    return 0
++}
++
+ ## === ENTRYPOINT START ===
+ 
+ # Wait for the container to fully initialize
+@@ -256,42 +321,53 @@
+     ## Update mods
+     if [[ -n $allMods ]]; then
+         echo -e "\n${GREEN}[UPDATE]:${NC} Checking all ${CYAN}Steam Workshop mods${NC} for updates..."
+-        for modID in $(echo $allMods | sed -e 's/@//g'); do
+-            if [[ $modID =~ ^[0-9]+$ ]]; then # Only check mods that are in ID-form
+-                # If a mod is defined in OPTIONALMODS, and is not defined in clientMods or SERVERMODS, then treat as an optional mod
+-                # Optional mods are given a different directory which is checked to see if a new update is available. This is to ensure
+-                # if an optional mod is switched to be a standard client-side mod, this script will redownload the mod
+-                if [[ "${OPTIONALMODS}" == *"@${modID};"* ]] && [[ "${clientMods}" != *"@${modID};"* ]] && [[ "${SERVERMODS}" != *"@${modID};"* ]]; then
+-                    modType=2
+-                    modDir=@${modID}_optional
+-                else
+-                    modType=1
+-                    modDir=@${modID}
+-                fi
+ 
+-                # Get mod's latest update in epoch time from its Steam Workshop changelog page
+-                latestUpdate=$(curl -sL https://steamcommunity.com/sharedfiles/filedetails/changelog/$modID | grep '<p id=' | head -1 | cut -d'"' -f2)
++        declare -A modResult modUpdated modTitle
++        modIDs=$(echo $allMods | sed -e 's/@//g' | tr ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ' ')
+ 
+-                # If the update time is valid and newer than the local directory's creation date, or the mod hasn't been downloaded yet, download the mod
+-                if [[ ! -d $modDir ]] || [[ ( -n $latestUpdate ) && ( $latestUpdate =~ ^[0-9]+$ ) && ( $latestUpdate > $(stat -c %Y "$modDir") ) ]]; then
+-                    # Get the mod's name from the Workshop page as well
+-                    modName=$(curl -sL https://steamcommunity.com/sharedfiles/filedetails/changelog/$modID | grep 'workshopItemTitle' | cut -d'>' -f2 | cut -d'<' -f1)
+-                    if [[ -z $modName ]]; then # Set default name if unavailable
+-                        modName="[NAME UNAVAILABLE]"
+-                    fi
+-                    if [[ ! -d $modDir ]]; then
+-                        echo -e "\n${GREEN}[UPDATE]:${NC} Downloading new Mod: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
+-                    else
+-                        echo -e "\n${GREEN}[UPDATE]:${NC} Mod update found for: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
+-                    fi
+-                    if [[ -n $latestUpdate ]] && [[ $latestUpdate =~ ^[0-9]+$ ]]; then # Notify last update date, if valid
+-                        echo -e "\tMod was last updated: ${CYAN}$(date -d @${latestUpdate})${NC}"
+-                    fi
+-                    
+-                    echo -e "\tAttempting mod update/download via SteamCMD...\n"
+-                    RunSteamCMD $modType $modID
+-                fi
++        # One lookup for every mod, rather than a web page per mod
++        apiOK=1
++        if [[ -n ${modIDs} ]] && ! FetchWorkshopDetails "${modIDs}"; then
++            apiOK=0
++            echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Could not reach the Steam Web API to check for mod updates."
++            echo -e "\t${YELLOW}Mods already downloaded will be left as they are; missing mods will still be fetched.${NC}"
++            echo -e "\t${YELLOW}(Check this container's outbound access to api.steampowered.com)${NC}"
++        fi
++
++        for modID in ${modIDs}; do
++            # If a mod is defined in OPTIONALMODS, and is not defined in clientMods or SERVERMODS, then treat as an optional mod
++            # Optional mods are given a different directory which is checked to see if a new update is available. This is to ensure
++            # if an optional mod is switched to be a standard client-side mod, this script will redownload the mod
++            if [[ "${OPTIONALMODS}" == *"@${modID};"* ]] && [[ "${clientMods}" != *"@${modID};"* ]] && [[ "${SERVERMODS}" != *"@${modID};"* ]]; then
++                modType=2
++                modDir=@${modID}_optional
++            else
++                modType=1
++                modDir=@${modID}
+             fi
++
++            modName=${modTitle[$modID]:-"[NAME UNAVAILABLE]"}
++
++            # Skip items the Workshop no longer serves, rather than retrying them on every start
++            if (( apiOK == 1 )) && [[ -n ${modResult[$modID]} ]] && (( ${modResult[$modID]} != 1 )); then
++                echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Mod ${CYAN}${modID}${NC} is no longer available on the Steam Workshop. ${CYAN}Skipping...${NC}"
++                echo -e "\t(It has been removed or made private. Please take it out of your mod list.)"
++                continue
++            fi
++
++            latestUpdate=${modUpdated[$modID]:-0}
++
++            if [[ ! -d $modDir ]]; then
++                echo -e "\n${GREEN}[UPDATE]:${NC} Downloading new Mod: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
++            elif (( apiOK == 1 && latestUpdate > 0 )) && (( latestUpdate > $(stat -c %Y "$modDir") )); then
++                echo -e "\n${GREEN}[UPDATE]:${NC} Mod update found for: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
++                echo -e "\tMod was last updated: ${CYAN}$(date -d @${latestUpdate})${NC}"
++            else
++                continue
++            fi
++
++            echo -e "\tAttempting mod update/download via SteamCMD...\n"
++            RunSteamCMD $modType $modID
+         done
+ 
+         # Check over key files for un-configured optional mods' .bikey files
+@@ -350,7 +426,7 @@
+ if [[ ! -f basic.cfg ]]; then
+     echo -e "\n${YELLOW}[STARTUP_WARN]: Basic Network Configuration file \"${CYAN}basic.cfg${YELLOW}\" is missing!${NC}"
+     echo -e "\t${YELLOW}Downloading default file for use instead...${NC}"
+-    curl -sSL ${BASIC_URL} -o ./basic.cfg
++    curl -sSL ${BASIC_CFG_URL} -o ./basic.cfg
+ fi
+ 
+ # Setup NSS Wrapper for use ($NSS_WRAPPER_PASSWD and $NSS_WRAPPER_GROUP have been set by the Dockerfile)
