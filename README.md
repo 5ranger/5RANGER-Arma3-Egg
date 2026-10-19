@@ -31,6 +31,20 @@ than as strings, and reports items the Workshop no longer serves instead of retr
 boot. If the API cannot be reached it says so and still downloads *missing* mods, because silence is
 the defect being fixed.
 
+**Every mod download pays for its own Steam login.** Upstream starts a separate `steamcmd`
+process with a fresh `+login` for each mod. Steam rate limits logins rather than downloads, so a
+boot that needs many mods runs out of sign-ins partway through and every mod after that point fails
+with `Logging in user ... ERROR (Rate Limit Exceeded)`, reported as an unknown SteamCMD error. On
+Operations (G1) a pass of 56 downloads got 44 and failed the last 12; because the loop runs in
+sorted ID order the failures are always the tail of the list, which is why the same handful of mods
+appeared to fail every time. This fork collects what needs fetching and passes 30 mods to one
+`steamcmd` session, so 131 mods take 5 logins instead of 131, and retries only what did not arrive.
+
+It also refuses to rebuild a mod's `@<id>` folder from an empty download. That rebuild starts with
+`rm -rf` and runs whenever SteamCMD exits without an error, which it does when it believes an item
+is current while the item's files are absent — the state 53 of G1's 133 recorded items were in. The
+hard-link copy is then the only one left, and the rebuild would replace it with nothing.
+
 **Optional mods lose their Workshop files.** Upstream deletes an optional mod's content once its
 `.bikey` files are copied, without telling SteamCMD, which goes on recording the item as installed
 at a manifest whose files are gone — 59 of the 139 items in G1's ACF were in that state. Signing
@@ -39,7 +53,7 @@ keys matter here because `verifySignatures = 2`, and key filenames are often ver
 players rejected. `OPTIONALMODS_KEEP_FILES` gates the deletion; **this fork defaults it to `1`**
 where upstream would default to `0`, because keeping all 56 optional mods costs 4.8 GB here.
 
-Four smaller fixes ride along: a mod that cannot be downloaded no longer aborts the whole start,
+Three smaller fixes ride along: a mod that cannot be downloaded no longer aborts the whole start,
 `$BASIC_URL` becomes `$BASIC_CFG_URL` (the name the current egg actually defines, so the `basic.cfg`
 fallback stopped writing an empty file), `ModsLowercase` no longer word-splits on names containing
 spaces, and the title lookup no longer costs a second HTTP request per mod.
