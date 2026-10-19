@@ -33,6 +33,7 @@ STEAMCMD_DIR="./steamcmd"                       # SteamCMD's directory containin
 WORKSHOP_DIR="./Steam/steamapps/workshop"       # SteamCMD's directory containing workshop downloads
 STEAMCMD_LOG="${STEAMCMD_DIR}/steamcmd.log"     # Log file for SteamCMD
 GAME_ID=107410                                  # SteamCMD ID for the Arma 3 GAME (not server). Only used for Workshop mod downloads.
+MODS_PER_SESSION=30                             # Workshop downloads per SteamCMD login. Steam rate limits logins, not downloads.
 SERVER_PARAM_FILE="startup_params_server.txt"   # File name for the auto-generated server par file to be used during startup
 HC_PARAM_FILE="startup_params_hc.txt"           # File name for the auto-generated Headless Client par file to be used during startup
 EGG_URL='https://github.com/pelican-eggs/games-steamcmd/tree/main/arma/arma3'   # URL for Egg & README (only used as info to legacy users)
@@ -50,152 +51,201 @@ NC='\033[0m' # No Color
 # PARAM_NOLOGS, PARAM_AUTOINIT, PARAM_FILEPATCHING, PARAM_LOADMISSIONTOMEMORY, PARAM_LIMITFPS
 
 ## === GLOBAL VARS ===
-# updateAttempt, modifiedStartup, allMods, clientMods
+# modifiedStartup, allMods, clientMods, modResult, modUpdated, modTitle
 
 ## === DEFINE FUNCTIONS ===
 
-# Runs SteamCMD with specified variables and performs error handling.
-function RunSteamCMD { #[Input: int server=0 mod=1 optional_mod=2; int id]
-    # Clear previous SteamCMD log
+# Runs one SteamCMD session and classifies what it logged.
+# Returns 0 on success, 1 when the caller should retry, and exits for anything fatal.
+function SteamCMDSession { #[Input: int server=0 mod=1 optional_mod=2; str appid | mod ids]
+    local kind=$1 target=$2 downloads="" id
+
     if [[ -f "${STEAMCMD_LOG}" ]]; then
         rm -f "${STEAMCMD_LOG:?}"
     fi
 
-    updateAttempt=0
-    # Loop for specified number of attempts
-    while (( $updateAttempt < $STEAMCMD_ATTEMPTS )); do
-        # Increment attempt counter
-        updateAttempt=$((updateAttempt+1))
+    if [[ ${kind} == 0 ]]; then # Server
+        ${STEAMCMD_DIR}/steamcmd.sh +force_install_dir ${HOME} "+login \"${STEAM_USER}\" \"${STEAM_PASS}\"" +app_update ${target} $( [[ -n ${STEAMCMD_BETAID} ]] && printf %s "-beta ${STEAMCMD_BETAID}" ) $( [[ ${VALIDATE_SERVER} == 1 ]] && printf %s "validate" ) +quit | tee -a "${STEAMCMD_LOG}"
+    else # Mods - every id in this session, behind a single login
+        for id in ${target}; do
+            downloads+=" +workshop_download_item ${GAME_ID} ${id}"
+        done
+        ${STEAMCMD_DIR}/steamcmd.sh "+login \"${STEAM_USER}\" \"${STEAM_PASS}\"" ${downloads} +quit | tee -a "${STEAMCMD_LOG}"
+    fi
 
-        # Notify if not first attempt
-        if (( $updateAttempt > 1 )); then
-            echo -e "\t${YELLOW}Re-Attempting download/update in 3 seconds...${NC} (Attempt ${CYAN}${updateAttempt}${NC} of ${CYAN}${STEAMCMD_ATTEMPTS}${NC})\n"
-            sleep 3
-        fi
+    local steamcmdExitCode=${PIPESTATUS[0]}
+    local loggedErrors
+    loggedErrors=$(grep -i "error\|failed" "${STEAMCMD_LOG}" | grep -iv "setlocal\|SDL\|steamservice\|thread priority\|libcurl")
 
-        # Check if updating server or mod
-        if [[ $1 == 0 ]]; then # Server
-            ${STEAMCMD_DIR}/steamcmd.sh +force_install_dir ${HOME} "+login \"${STEAM_USER}\" \"${STEAM_PASS}\"" +app_update $2 $( [[ -n ${STEAMCMD_BETAID} ]] && printf %s "-beta ${STEAMCMD_BETAID}" ) $( [[ ${VALIDATE_SERVER} == 1 ]] && printf %s "validate" ) +quit | tee -a "${STEAMCMD_LOG}"
-        else # Mod
-            ${STEAMCMD_DIR}/steamcmd.sh "+login \"${STEAM_USER}\" \"${STEAM_PASS}\"" +workshop_download_item ${GAME_ID} $2 +quit | tee -a "${STEAMCMD_LOG}"
+    if [[ -n ${loggedErrors} ]]; then
+        # Soft errors - worth another attempt
+        if [[ -n $(grep -i "Rate Limit Exceeded" "${STEAMCMD_LOG}") ]]; then # Steam refused the login
+            echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Steam is rate limiting logins from this address."
+            echo -e "\t(Too many SteamCMD sign-ins in a short time. Backing off and trying again.)"
+            return 1
+        elif [[ -n $(grep -i "Timeout downloading item" "${STEAMCMD_LOG}") ]]; then # Mod download timeout
+            echo -e "\n${YELLOW}[UPDATE]: ${NC}Timeout downloading a Steam Workshop mod."
+            echo -e "\t(This is expected for particularly large mods)"
+            return 1
+        elif [[ -n $(grep -i "0x402\|0x6\|0x602" "${STEAMCMD_LOG}") ]]; then # Connection issue with Steam
+            echo -e "\n${YELLOW}[UPDATE]: ${NC}Connection issue with Steam servers."
+            echo -e "\t(Steam servers may currently be down, or a connection cannot be made reliably)"
+            return 1
+        # Hard errors
+        elif [[ -n $(grep -i "Password check for AppId" "${STEAMCMD_LOG}") ]]; then # Incorrect beta branch password
+            echo -e "\n${RED}[UPDATE]: ${YELLOW}Incorrect password given for beta branch \"${STEAMCMD_BETAID}\". ${CYAN}Skipping download...${NC}"
+            echo -e "\t(Please contact the maintainer of this image; an update may be required)"
+            return 2
+        # Fatal errors
+        elif [[ -n $(grep -i "Invalid Password\|two-factor\|No subscription" "${STEAMCMD_LOG}") ]]; then # Wrong username/password, Steam Guard is turned on, or host is using anonymous account
+            echo -e "\n${RED}[UPDATE]: Cannot login to Steam - Improperly configured account and/or credentials${NC}"
+            echo -e "\t${YELLOW}Please contact your administrator/host and give them the following message:${NC}"
+            echo -e "\t${CYAN}Your Egg, or your client's server, is not configured with valid Steam credentials.${NC}"
+            echo -e "\t${CYAN}Either the username/password is wrong, or Steam Guard is not fully disabled${NC}"
+            echo -e "\t${CYAN}in accordance to this Egg's documentation/README.${NC}\n"
+            exit 1
+        elif [[ -n $(grep -i "0x202\|0x212" "${STEAMCMD_LOG}") ]]; then # Not enough disk space
+            echo -e "\n${RED}[UPDATE]: Unable to complete download - Not enough storage${NC}"
+            echo -e "\t${YELLOW}You have run out of your allotted disk space.${NC}"
+            echo -e "\t${YELLOW}Please contact your administrator/host for potential storage upgrades.${NC}\n"
+            exit 1
+        elif [[ -n $(grep -i "0x606" "${STEAMCMD_LOG}") ]]; then # Disk write failure
+            echo -e "\n${RED}[UPDATE]: Unable to complete download - Disk write failure${NC}"
+            echo -e "\t${YELLOW}This is normally caused by directory permissions issues,${NC}"
+            echo -e "\t${YELLOW}but could be a more serious hardware issue.${NC}"
+            echo -e "\t${YELLOW}(Please contact your administrator/host if this issue persists)${NC}\n"
+            exit 1
+        elif [[ -n $(grep -i "Download item" "${STEAMCMD_LOG}") ]]; then # A mod SteamCMD would not serve
+            echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}SteamCMD refused to download one or more mods in this session."
+            echo -e "\t${YELLOW}The account may not own the base game, may lack access to a private item,${NC}"
+            echo -e "\t${YELLOW}or the item may no longer exist.${NC}"
+            return 1
+        else # Unknown caught error
+            echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}An unrecognised SteamCMD error occurred."
+            echo -e "SteamCMD Errors:\n${loggedErrors}"
+            return 1
         fi
+    elif [[ ${steamcmdExitCode} != 0 ]]; then # Unknown fatal error
+        echo -e "\n${RED}[UPDATE]: SteamCMD has crashed for an unknown reason!${NC} (Exit code: ${CYAN}${steamcmdExitCode}${NC})"
+        echo -e "\t${YELLOW}(Please contact your administrator/host for support)${NC}\n"
+        cp -r /tmp/dumps ./dumps
+        exit ${steamcmdExitCode}
+    fi
+    return 0
+}
 
-        # Error checking for SteamCMD
-        steamcmdExitCode=${PIPESTATUS[0]}
-        loggedErrors=$(grep -i "error\|failed" "${STEAMCMD_LOG}" | grep -iv "setlocal\|SDL\|steamservice\|thread priority\|libcurl")
-        if [[ -n ${loggedErrors} ]]; then # Catch errors (ignore setlocale, SDL, steamservice, thread priority, and libcurl warnings)
-            # Soft errors
-            if [[ -n $(grep -i "Timeout downloading item" "${STEAMCMD_LOG}") ]]; then # Mod download timeout
-                echo -e "\n${YELLOW}[UPDATE]: ${NC}Timeout downloading Steam Workshop mod: \"${CYAN}${modName}${NC}\" (${CYAN}${2}${NC})"
-                echo -e "\t(This is expected for particularly large mods)"
-            elif [[ -n $(grep -i "0x402\|0x6\|0x602" "${STEAMCMD_LOG}") ]]; then # Connection issue with Steam
-                echo -e "\n${YELLOW}[UPDATE]: ${NC}Connection issue with Steam servers."
-                echo -e "\t(Steam servers may currently be down, or a connection cannot be made reliably)"
-            # Hard errors
-            elif [[ -n $(grep -i "Password check for AppId" "${STEAMCMD_LOG}") ]]; then # Incorrect beta branch password
-                echo -e "\n${RED}[UPDATE]: ${YELLOW}Incorrect password given for beta branch \"${STEAMCMD_BETAID}\". ${CYAN}Skipping download...${NC}"
-                echo -e "\t(Please contact the maintainer of this image; an update may be required)"
-                break
-            # Fatal errors
-            elif [[ -n $(grep -i "Invalid Password\|two-factor\|No subscription" "${STEAMCMD_LOG}") ]]; then # Wrong username/password, Steam Guard is turned on, or host is using anonymous account
-                echo -e "\n${RED}[UPDATE]: Cannot login to Steam - Improperly configured account and/or credentials${NC}"
-                echo -e "\t${YELLOW}Please contact your administrator/host and give them the following message:${NC}"
-                echo -e "\t${CYAN}Your Egg, or your client's server, is not configured with valid Steam credentials.${NC}"
-                echo -e "\t${CYAN}Either the username/password is wrong, or Steam Guard is not fully disabled${NC}"
-                echo -e "\t${CYAN}in accordance to this Egg's documentation/README.${NC}\n"
-                exit 1
-            elif [[ -n $(grep -i "Download item" "${STEAMCMD_LOG}") ]]; then # Steam account does not own base game for mod downloads, account rate-limit, or unknown
-                echo -e "\n${RED}[UPDATE]: Cannot download mod - Download failed${NC}"
-                echo -e "\t${YELLOW}While unknown, this error is likely due to your host's Steam account not owning the base game,${NC}"
-                echo -e "\t${YELLOW}or the account is being rate-limited by Steam.${NC}"
-                echo -e "\t${YELLOW}(Please contact your administrator/host if this issue persists)${NC}\n"
-                if [[ $1 == 0 ]]; then # Only fatal for the game server itself
-                    exit 1
-                fi
-                break
-            elif [[ -n $(grep -i "0x202\|0x212" "${STEAMCMD_LOG}") ]]; then # Not enough disk space
-                echo -e "\n${RED}[UPDATE]: Unable to complete download - Not enough storage${NC}"
-                echo -e "\t${YELLOW}You have run out of your allotted disk space.${NC}"
-                echo -e "\t${YELLOW}Please contact your administrator/host for potential storage upgrades.${NC}\n"
-                exit 1
-            elif [[ -n $(grep -i "0x606" "${STEAMCMD_LOG}") ]]; then # Disk write failure
-                echo -e "\n${RED}[UPDATE]: Unable to complete download - Disk write failure${NC}"
-                echo -e "\t${YELLOW}This is normally caused by directory permissions issues,${NC}"
-                echo -e "\t${YELLOW}but could be a more serious hardware issue.${NC}"
-                echo -e "\t${YELLOW}(Please contact your administrator/host if this issue persists)${NC}\n"
-                exit 1
-            else # Unknown caught error
-                echo -e "\n${RED}[UPDATE]: ${YELLOW}An unknown error has occurred with SteamCMD. ${CYAN}Skipping download...${NC}"
-                echo -e "SteamCMD Errors:\n${loggedErrors}"
-                echo -e "\t${YELLOW}(Please contact your administrator/host if this issue persists)${NC}\n"
-                break
-            fi
-        elif [[ $steamcmdExitCode != 0 ]]; then # Unknown fatal error
-            echo -e "\n${RED}[UPDATE]: SteamCMD has crashed for an unknown reason!${NC} (Exit code: ${CYAN}${steamcmdExitCode}${NC})"
-            echo -e "\t${YELLOW}(Please contact your administrator/host for support)${NC}\n"
-            cp -r /tmp/dumps ./dumps
-            exit $steamcmdExitCode
-        else # Success!
-            if [[ $1 == 0 ]]; then # Server
-                echo -e "\n${GREEN}[UPDATE]: Game server is up to date!${NC}"
-            else # Mod
-                # Refuse to rebuild from an empty or absent source. SteamCMD reports success when
-                # it believes an item is current, which it can do while the item's files are gone -
-                # and the rebuild below starts with "rm -rf", so an empty source would destroy the
-                # only remaining copy of a mod that may not be downloadable again.
-                if [[ ! -d "${WORKSHOP_DIR}/content/${GAME_ID}/$2" ]] || [[ -z "$(ls -A "${WORKSHOP_DIR}/content/${GAME_ID}/$2" 2>/dev/null)" ]]; then
-                    echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}SteamCMD reported success for ${CYAN}$2${NC} but downloaded no files."
-                    echo -e "\t${YELLOW}Keeping the copy already in place and leaving it untouched.${NC}"
-                    echo -e "\t(SteamCMD's records say this mod is installed while its files are missing."
-                    echo -e "\t Delete its entry from ${CYAN}${WORKSHOP_DIR}/appworkshop_${GAME_ID}.acf${NC} to force a full download.)"
-                    break
-                fi
-                echo -e "\n\tMoving any mod ${CYAN}.bikey${NC} files to the ${CYAN}keys/${NC} folder..."
-                if [[ $1 == 1 ]]; then # Regular mod
-                    # Move any .bikey's to the keys directory
-                    find "${WORKSHOP_DIR}/content/${GAME_ID}/$2" -name "*.bikey" -type f -exec cp -t "keys" {} +
-                    # Make a fresh hard link copy of the downloaded mod to the current directory
-                    echo -e "\tMaking ${CYAN}hard link${NC} copy of mod to: ${CYAN}$(pwd)/@$2${NC}"
-                    rm -rf @$2
-                    mkdir @$2
-                    cp -al ${WORKSHOP_DIR}/content/${GAME_ID}/$2/* @$2/
-                    # Make the hard link copy's contents all lowercase
-                    # (This complies with Arma's mod-folder rules while not disturbing the mod's SteamCMD source files)
-                    ModsLowercase @$2
-                elif [[ $1 == 2 ]]; then # Optional mod
-                    # Give optional mod keys a custom name during move which can be checked later for deleting un-configured mods
-                    for file in $(find "${WORKSHOP_DIR}/content/${GAME_ID}/$2" -name "*.bikey" -type f); do
-                        filename=$(basename ${file})
-                        cp $file keys/optional_$2_${filename}
-                    done;
-                    # Delete mod folder to save space, unless the admin has asked to keep it.
-                    # Deleting it leaves the item recorded in appworkshop_<GAME_ID>.acf as installed
-                    # while its files are gone, so SteamCMD is later asked to update content it no
-                    # longer has.
-                    if [[ ${OPTIONALMODS_KEEP_FILES:-1} == "1" ]]; then
-                        echo -e "\tMod is an ${CYAN}optional mod${NC}. Keeping mod files (${CYAN}OPTIONALMODS_KEEP_FILES${NC} is enabled)."
-                    else
-                        echo -e "\tMod is an ${CYAN}optional mod${NC}. Deleting mod files to save space..."
-                        rm -r ${WORKSHOP_DIR}/content/${GAME_ID}/$2
-                    fi
-                    # Create a directory so time-based detection of auto updates works correctly
-                    mkdir -p "@${2}_optional" && touch "@${2}_optional"
-                    touch "@${2}_optional/DON'T DELETE THIS DIRECTORY - USED FOR AUTO UPDATES"
-                fi
-                echo -e "${GREEN}[UPDATE]: Mod download/update successful!${NC}"
-            fi
-            break
+# Copies a downloaded mod's keys into keys/ and (re)builds its @<id> folder.
+function InstallWorkshopMod { #[Input: int mod=1 optional_mod=2; int id]
+    local kind=$1 id=$2 src="${WORKSHOP_DIR}/content/${GAME_ID}/$2" file filename
+
+    # Refuse to rebuild from an empty or absent source. SteamCMD reports success when it believes
+    # an item is current, which it can do while the item's files are gone - and the rebuild below
+    # starts with "rm -rf", so an empty source would destroy the only copy left of a mod that may
+    # not be downloadable again.
+    if [[ ! -d "${src}" ]] || [[ -z "$(ls -A "${src}" 2>/dev/null)" ]]; then
+        echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}No downloaded files present for ${CYAN}${id}${NC}."
+        echo -e "\t${YELLOW}Keeping the copy already in place and leaving it untouched.${NC}"
+        echo -e "\t(If SteamCMD's records say this mod is installed while its files are missing,"
+        echo -e "\t delete its entry from ${CYAN}${WORKSHOP_DIR}/appworkshop_${GAME_ID}.acf${NC} to force a full download.)"
+        return 1
+    fi
+
+    echo -e "\n\tMoving ${CYAN}${id}${NC}'s ${CYAN}.bikey${NC} files to the ${CYAN}keys/${NC} folder..."
+    if [[ ${kind} == 1 ]]; then # Regular mod
+        find "${src}" -name "*.bikey" -type f -exec cp -t "keys" {} +
+        # Make a fresh hard link copy of the downloaded mod to the current directory
+        echo -e "\tMaking ${CYAN}hard link${NC} copy of mod to: ${CYAN}$(pwd)/@${id}${NC}"
+        rm -rf @${id}
+        mkdir @${id}
+        cp -al ${src}/* @${id}/
+        # Make the hard link copy's contents all lowercase
+        # (This complies with Arma's mod-folder rules while not disturbing the mod's SteamCMD source files)
+        ModsLowercase @${id}
+    else # Optional mod
+        # Give optional mod keys a custom name during move which can be checked later for deleting un-configured mods
+        for file in $(find "${src}" -name "*.bikey" -type f); do
+            filename=$(basename ${file})
+            cp $file keys/optional_${id}_${filename}
+        done;
+        # Deleting the files leaves the item recorded in appworkshop_<GAME_ID>.acf as installed
+        # while its files are gone, so SteamCMD is later asked to update content it no longer has.
+        if [[ ${OPTIONALMODS_KEEP_FILES:-1} == "1" ]]; then
+            echo -e "\tMod is an ${CYAN}optional mod${NC}. Keeping mod files (${CYAN}OPTIONALMODS_KEEP_FILES${NC} is enabled)."
+        else
+            echo -e "\tMod is an ${CYAN}optional mod${NC}. Deleting mod files to save space..."
+            rm -r ${src}
         fi
-        if (( $updateAttempt == $STEAMCMD_ATTEMPTS )); then # Notify if failed last attempt
-            if [[ $1 == 0 ]]; then # Server
-                echo -e "\t${RED}Final attempt made! ${YELLOW}Unable to complete game server update. ${CYAN}Skipping...${NC}"
-                echo -e "\t(Please try again at a later time)"
-                sleep 3
-            else # Mod
-                echo -e "\t${RED}Final attempt made! ${YELLOW}Unable to complete mod download/update. ${CYAN}Skipping...${NC}"
-                echo -e "\t(You may try again later, or manually upload this mod to your server via SFTP)"
-                sleep 3
+        # Create a directory so time-based detection of auto updates works correctly
+        mkdir -p "@${id}_optional" && touch "@${id}_optional"
+        touch "@${id}_optional/DON'T DELETE THIS DIRECTORY - USED FOR AUTO UPDATES"
+    fi
+    echo -e "${GREEN}[UPDATE]: ${CYAN}${id}${GREEN} download/update successful!${NC}"
+    return 0
+}
+
+# Updates the game server, or downloads a set of Workshop mods and installs each one.
+#
+# Mods are fetched MODS_PER_SESSION at a time behind a single SteamCMD login, because Steam rate
+# limits *logins* rather than downloads: one login per mod fails partway through any sizeable
+# batch, and every mod after the limit is reached logs
+# "Logging in user ... ERROR (Rate Limit Exceeded)" and is skipped. Measured on a 131-mod server,
+# 44 mods downloaded and the remaining 12 all failed that way.
+function RunSteamCMD { #[Input: int server=0 mod=1 optional_mod=2; str appid | mod ids]
+    local kind=$1
+    local pending=($2)
+    local attempt=0 i rc id batch failed
+
+    if [[ ${kind} == 0 ]]; then # Server
+        while (( attempt < STEAMCMD_ATTEMPTS )); do
+            attempt=$((attempt+1))
+            if (( attempt > 1 )); then
+                echo -e "\t${YELLOW}Re-attempting game server update in 10 seconds...${NC} (Attempt ${CYAN}${attempt}${NC} of ${CYAN}${STEAMCMD_ATTEMPTS}${NC})\n"
+                sleep 10
             fi
+            SteamCMDSession 0 "$2" && { echo -e "\n${GREEN}[UPDATE]: Game server is up to date!${NC}"; return 0; }
+            (( $? == 2 )) && break
+        done
+        echo -e "\t${RED}Unable to complete game server update. ${CYAN}Skipping...${NC}"
+        echo -e "\t(Please try again at a later time)"
+        sleep 3
+        return 1
+    fi
+
+    # Download, in as few logins as possible, retrying whatever did not arrive
+    while (( ${#pending[@]} > 0 && attempt < STEAMCMD_ATTEMPTS )); do
+        attempt=$((attempt+1))
+        if (( attempt > 1 )); then
+            echo -e "\n\t${YELLOW}Re-attempting ${CYAN}${#pending[@]}${YELLOW} mod download(s) in 60 seconds...${NC} (Attempt ${CYAN}${attempt}${NC} of ${CYAN}${STEAMCMD_ATTEMPTS}${NC})"
+            echo -e "\t(A pause here also lets any Steam login rate limit expire)\n"
+            sleep 60
+        fi
+        i=0
+        while (( i < ${#pending[@]} )); do
+            batch=("${pending[@]:i:MODS_PER_SESSION}")
+            i=$((i+MODS_PER_SESSION))
+            echo -e "\n${GREEN}[UPDATE]:${NC} Downloading ${CYAN}${#batch[@]}${NC} mod(s) in one SteamCMD session...\n"
+            SteamCMDSession "${kind}" "${batch[*]}"
+            rc=$?
+            (( rc == 2 )) && break 2
+        done
+        # Keep only the mods whose files did not arrive
+        failed=()
+        for id in "${pending[@]}"; do
+            [[ -d "${WORKSHOP_DIR}/content/${GAME_ID}/${id}" ]] || failed+=("${id}")
+        done
+        pending=("${failed[@]}")
+    done
+
+    if (( ${#pending[@]} > 0 )); then
+        echo -e "\n\t${RED}Unable to download ${CYAN}${#pending[@]}${RED} mod(s): ${CYAN}${pending[*]}${NC}"
+        echo -e "\t(You may try again later, or upload them to your server via SFTP)"
+        sleep 3
+    fi
+
+    # Install everything that did arrive
+    for id in $2; do
+        if [[ -d "${WORKSHOP_DIR}/content/${GAME_ID}/${id}" ]]; then
+            InstallWorkshopMod "${kind}" "${id}"
         fi
     done
 }
@@ -346,6 +396,7 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
         echo -e "\n${GREEN}[UPDATE]:${NC} Checking all ${CYAN}Steam Workshop mods${NC} for updates..."
 
         declare -A modResult modUpdated modTitle
+        fetchMods="" ; fetchOptional=""
         modIDs=$(echo $allMods | sed -e 's/@//g' | tr ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ' ')
 
         # One lookup for every mod, rather than a web page per mod
@@ -394,9 +445,20 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
                 continue
             fi
 
-            echo -e "\tAttempting mod update/download via SteamCMD...\n"
-            RunSteamCMD $modType $modID
+            # Collected rather than fetched one at a time, so every mod shares a login
+            if (( modType == 2 )); then
+                fetchOptional+=" ${modID}"
+            else
+                fetchMods+=" ${modID}"
+            fi
         done
+
+        if [[ -n ${fetchMods}${fetchOptional} ]]; then
+            [[ -n ${fetchMods} ]] && RunSteamCMD 1 "${fetchMods}"
+            [[ -n ${fetchOptional} ]] && RunSteamCMD 2 "${fetchOptional}"
+        else
+            echo -e "\n${GREEN}[UPDATE]:${NC} All mods are already up to date."
+        fi
 
         # Check over key files for un-configured optional mods' .bikey files
         for keyFile in $(find "keys" -name "*.bikey" -type f); do
