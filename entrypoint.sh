@@ -3,7 +3,7 @@
 # 5 RANGER Arma 3 yolk entrypoint — a fork of upstream's, with two defects fixed.
 #
 # Upstream:   parkervcp/yolks, games/arma3/entrypoint.sh (AGPL-3.0-or-later, Red-Thirten)
-# Downstream: ghcr.io/gibsx/5ranger-arma3:latest, run by Wings for Pterodactyl egg 68
+# Downstream: ghcr.io/5ranger/5ranger-arma3:latest, run by Wings for the Arma 3 egg
 # Uses:       curl and awk (mawk), both already in debian:bookworm-slim; no added packages
 #
 # Everything below this header is upstream's file plus the changes in upstream.patch.

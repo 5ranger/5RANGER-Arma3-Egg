@@ -1,7 +1,7 @@
-# 5ranger-arma3-egg
+# 5RANGER-Arma3-Egg
 
 The Arma 3 yolk image the 5 RANGER Operations servers run, as a thin overlay over upstream's.
-Published as `ghcr.io/gibsx/5ranger-arma3:latest` and pulled by Wings for Pterodactyl egg 68.
+Published as `ghcr.io/5ranger/5ranger-arma3:latest` and pulled by Wings for the Arma 3 egg.
 
 `Dockerfile` replaces `/entrypoint.sh` and nothing else. Base packages, locale, the NSS wrapper,
 tini and the container user are all inherited from `ghcr.io/parkervcp/games:arma3`, so the image
@@ -57,6 +57,30 @@ Three smaller fixes ride along: a mod that cannot be downloaded no longer aborts
 `$BASIC_URL` becomes `$BASIC_CFG_URL` (the name the current egg actually defines, so the `basic.cfg`
 fallback stopped writing an empty file), `ModsLowercase` no longer word-splits on names containing
 spaces, and the title lookup no longer costs a second HTTP request per mod.
+
+## What is here
+
+| | |
+|---|---|
+| `entrypoint.sh` | the script the image replaces; everything else in the image is inherited |
+| `Dockerfile` | the overlay — two lines |
+| `egg-arma3.json` | the egg, as a `PTDL_v2` export. Import it in the panel UI; the Application API is read-only for eggs |
+| `ci/build.yml` | the image build. **Move it to `.github/workflows/build.yml` to make it run** — see the note at the top of that file |
+| `tools/repair-steamcmd-records.py` | a one-off, run per server, for any server that ran the old entrypoint |
+| `upstream.patch` | the exact diff against upstream's `games/arma3/entrypoint.sh` |
+
+## Deploying it
+
+1. `git mv ci/build.yml .github/workflows/build.yml` and push, so the image is built and published.
+2. Make the resulting package **public** from its own settings page. Wings is configured with no
+   registry credentials, so it cannot pull a private package.
+3. Import `egg-arma3.json` in the panel, or add `ghcr.io/5ranger/5ranger-arma3:latest` to the
+   existing egg's Docker images and set it as the default.
+4. Set `OPTIONALMODS_KEEP_FILES` to `1` on each server. The entrypoint defaults to keeping the files
+   when the variable is absent, so this only matters if the egg sets it to `0`.
+5. On any server that ran the old entrypoint, stop it and run
+   `tools/repair-steamcmd-records.py <volume> --apply` once, then start it. Expect a long first boot:
+   it refetches everything the old version had recorded as installed without files on disk.
 
 ## Retiring this
 

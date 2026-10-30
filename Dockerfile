@@ -1,7 +1,7 @@
 # 5 RANGER Arma 3 yolk — thin overlay over upstream.
 #
 # Upstream:   ghcr.io/parkervcp/games:arma3 (parkervcp/yolks, games/arma3)
-# Downstream: Pterodactyl egg 68 "Arma 3", servers Operations (G1) and Operations (F1)
+# Downstream: ghcr.io/5ranger/5ranger-arma3:latest, pulled by Wings for the Arma 3 egg
 # Uses:       nothing beyond the base image; the entrypoint needs only tools debian already ships
 #
 # Replaces only /entrypoint.sh. Everything else — base packages, locale, NSS wrapper, tini,
