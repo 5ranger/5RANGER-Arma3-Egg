@@ -51,9 +51,25 @@ NC='\033[0m' # No Color
 # PARAM_NOLOGS, PARAM_AUTOINIT, PARAM_FILEPATCHING, PARAM_LOADMISSIONTOMEMORY, PARAM_LIMITFPS
 
 ## === GLOBAL VARS ===
-# modifiedStartup, allMods, clientMods, modResult, modUpdated, modTitle
+# modifiedStartup, allMods, clientMods, modResult, modUpdated, modTitle,
+# newMods, updatedMods, recheckMods, currentMods
 
 ## === DEFINE FUNCTIONS ===
+
+# Renders a Workshop ID as its title and ID, so the console names what is being worked on rather
+# than only numbering it. SteamCMD's own output is ID-only, which leaves a 130-mod start-up
+# unreadable without looking every number up by hand. Falls back to the bare ID for an item the
+# public API would not name, since inventing a name for it would be worse than showing none.
+function ModName { #[Input: int id - Output: printf of "Title" (id), or id]
+    local id=$1 title=${modTitle[$1]:-}
+    # Doubled so the caller's "echo -e" prints a backslash in a title rather than reading it as an escape
+    title=${title//\\/\\\\}
+    if [[ -z ${title} || ${title} == "[NAME UNAVAILABLE]" ]]; then
+        printf '%s' "${CYAN}${id}${NC}"
+    else
+        printf '%s' "\"${CYAN}${title}${NC}\" (${CYAN}${id}${NC})"
+    fi
+}
 
 # Runs one SteamCMD session and classifies what it logged.
 # Returns 0 on success, 1 when the caller should retry, and exits for anything fatal.
@@ -136,21 +152,24 @@ function SteamCMDSession { #[Input: int server=0 mod=1 optional_mod=2; str appid
 
 # Copies a downloaded mod's keys into keys/ and (re)builds its @<id> folder.
 function InstallWorkshopMod { #[Input: int mod=1 optional_mod=2; int id]
-    local kind=$1 id=$2 src="${WORKSHOP_DIR}/content/${GAME_ID}/$2" file filename
+    local kind=$1 id=$2 src="${WORKSHOP_DIR}/content/${GAME_ID}/$2" file filename keyCount size
 
     # Refuse to rebuild from an empty or absent source. SteamCMD reports success when it believes
     # an item is current, which it can do while the item's files are gone - and the rebuild below
     # starts with "rm -rf", so an empty source would destroy the only copy left of a mod that may
     # not be downloadable again.
     if [[ ! -d "${src}" ]] || [[ -z "$(ls -A "${src}" 2>/dev/null)" ]]; then
-        echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}No downloaded files present for ${CYAN}${id}${NC}."
+        echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}No downloaded files present for $(ModName "${id}")."
         echo -e "\t${YELLOW}Keeping the copy already in place and leaving it untouched.${NC}"
         echo -e "\t(If SteamCMD's records say this mod is installed while its files are missing,"
         echo -e "\t delete its entry from ${CYAN}${WORKSHOP_DIR}/appworkshop_${GAME_ID}.acf${NC} to force a full download.)"
         return 1
     fi
 
-    echo -e "\n\tMoving ${CYAN}${id}${NC}'s ${CYAN}.bikey${NC} files to the ${CYAN}keys/${NC} folder..."
+    keyCount=$(find "${src}" -name "*.bikey" -type f | wc -l)
+    size=$(du -sh "${src}" 2>/dev/null | cut -f1)
+    echo -e "\n\tInstalling $(ModName "${id}") (${CYAN}${size:-unknown size}${NC})"
+    echo -e "\tMoving ${CYAN}${keyCount}${NC} ${CYAN}.bikey${NC} file(s) to the ${CYAN}keys/${NC} folder..."
     if [[ ${kind} == 1 ]]; then # Regular mod
         find "${src}" -name "*.bikey" -type f -exec cp -t "keys" {} +
         # Make a fresh hard link copy of the downloaded mod to the current directory
@@ -179,7 +198,7 @@ function InstallWorkshopMod { #[Input: int mod=1 optional_mod=2; int id]
         mkdir -p "@${id}_optional" && touch "@${id}_optional"
         touch "@${id}_optional/DON'T DELETE THIS DIRECTORY - USED FOR AUTO UPDATES"
     fi
-    echo -e "${GREEN}[UPDATE]: ${CYAN}${id}${GREEN} download/update successful!${NC}"
+    echo -e "${GREEN}[UPDATE]: $(ModName "${id}")${GREEN} download/update successful!${NC}"
     return 0
 }
 
@@ -223,7 +242,11 @@ function RunSteamCMD { #[Input: int server=0 mod=1 optional_mod=2; str appid | m
         while (( i < ${#pending[@]} )); do
             batch=("${pending[@]:i:MODS_PER_SESSION}")
             i=$((i+MODS_PER_SESSION))
-            echo -e "\n${GREEN}[UPDATE]:${NC} Downloading ${CYAN}${#batch[@]}${NC} mod(s) in one SteamCMD session...\n"
+            echo -e "\n${GREEN}[UPDATE]:${NC} Downloading ${CYAN}${#batch[@]}${NC} mod(s) in one SteamCMD session:"
+            for id in "${batch[@]}"; do
+                echo -e "\t- $(ModName "${id}")"
+            done
+            echo -e ""
             SteamCMDSession "${kind}" "${batch[*]}"
             rc=$?
             (( rc == 2 )) && break 2
@@ -237,7 +260,10 @@ function RunSteamCMD { #[Input: int server=0 mod=1 optional_mod=2; str appid | m
     done
 
     if (( ${#pending[@]} > 0 )); then
-        echo -e "\n\t${RED}Unable to download ${CYAN}${#pending[@]}${RED} mod(s): ${CYAN}${pending[*]}${NC}"
+        echo -e "\n\t${RED}Unable to download ${CYAN}${#pending[@]}${RED} mod(s):${NC}"
+        for id in "${pending[@]}"; do
+            echo -e "\t  - $(ModName "${id}")"
+        done
         echo -e "\t(You may try again later, or upload them to your server via SFTP)"
         sleep 3
     fi
@@ -397,6 +423,7 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
 
         declare -A modResult modUpdated modTitle
         fetchMods="" ; fetchOptional=""
+        newMods=() ; updatedMods=() ; recheckMods=() ; currentMods=()
         modIDs=$(echo $allMods | sed -e 's/@//g' | tr ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ' ')
 
         # One lookup for every mod, rather than a web page per mod
@@ -420,8 +447,6 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
                 modDir=@${modID}
             fi
 
-            modName=${modTitle[$modID]:-"[NAME UNAVAILABLE]"}
-
             # The public API cannot see a private or unlisted item, and reports it exactly as it
             # reports a deleted one. Rather than skip it - which would strip a server of its own
             # unpublished mods - let SteamCMD decide, since it is logged in and we are not.
@@ -429,19 +454,25 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
             if (( apiOK == 1 )) && [[ -n ${modResult[$modID]} ]] && (( ${modResult[$modID]} != 1 )); then
                 modUnknown=1
                 echo -e "\n${YELLOW}[UPDATE_WARN]: ${NC}Mod ${CYAN}${modID}${NC} could not be looked up on the Steam Workshop."
-                echo -e "\t(It is private, unlisted, or removed. Asking SteamCMD, which is signed in, instead.)"
+                echo -e "\t(It is private, unlisted, or removed, so its name cannot be shown either.)"
+                echo -e "\t(Asking SteamCMD, which is signed in, instead.)"
             fi
 
             latestUpdate=${modUpdated[$modID]:-0}
 
             if [[ ! -d $modDir ]]; then
-                echo -e "\n${GREEN}[UPDATE]:${NC} Downloading new Mod: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
+                echo -e "\n${GREEN}[UPDATE]:${NC} New mod, not yet on disk: $(ModName "${modID}")"
+                newMods+=("${modID}")
             elif (( modUnknown == 1 )); then
                 echo -e "\t${CYAN}Checking it with SteamCMD...${NC}"
+                recheckMods+=("${modID}")
             elif (( apiOK == 1 && latestUpdate > 0 )) && (( latestUpdate > $(stat -c %Y "$modDir") )); then
-                echo -e "\n${GREEN}[UPDATE]:${NC} Mod update found for: \"${CYAN}${modName}${NC}\" (${CYAN}${modID}${NC})"
-                echo -e "\tMod was last updated: ${CYAN}$(date -d @${latestUpdate})${NC}"
+                echo -e "\n${GREEN}[UPDATE]:${NC} Mod update found for: $(ModName "${modID}")"
+                echo -e "\tWorkshop copy updated: ${CYAN}$(date -d @${latestUpdate})${NC}"
+                echo -e "\tCopy on disk dates from: ${CYAN}$(date -d @$(stat -c %Y "$modDir"))${NC}"
+                updatedMods+=("${modID}")
             else
+                currentMods+=("${modID}")
                 continue
             fi
 
@@ -456,8 +487,26 @@ if [[ ${UPDATE_SERVER} == 1 ]]; then
         if [[ -n ${fetchMods}${fetchOptional} ]]; then
             [[ -n ${fetchMods} ]] && RunSteamCMD 1 "${fetchMods}"
             [[ -n ${fetchOptional} ]] && RunSteamCMD 2 "${fetchOptional}"
+
+            # Collected here because SteamCMD's own output is interleaved and ID-only: on a server
+            # with this many mods, what changed is otherwise only reconstructable by reading back
+            # the whole log.
+            echo -e "\n${GREEN}[UPDATE]:${NC} Steam Workshop summary:"
+            echo -e "\t${CYAN}${#currentMods[@]}${NC} mod(s) were already up to date"
+            if (( ${#newMods[@]} > 0 )); then
+                echo -e "\t${CYAN}${#newMods[@]}${NC} mod(s) downloaded for the first time:"
+                for modID in "${newMods[@]}"; do echo -e "\t  - $(ModName "${modID}")"; done
+            fi
+            if (( ${#updatedMods[@]} > 0 )); then
+                echo -e "\t${CYAN}${#updatedMods[@]}${NC} mod(s) updated:"
+                for modID in "${updatedMods[@]}"; do echo -e "\t  - $(ModName "${modID}")"; done
+            fi
+            if (( ${#recheckMods[@]} > 0 )); then
+                echo -e "\t${CYAN}${#recheckMods[@]}${NC} mod(s) the Workshop would not describe, left to SteamCMD:"
+                for modID in "${recheckMods[@]}"; do echo -e "\t  - $(ModName "${modID}")"; done
+            fi
         else
-            echo -e "\n${GREEN}[UPDATE]:${NC} All mods are already up to date."
+            echo -e "\n${GREEN}[UPDATE]:${NC} All ${CYAN}${#currentMods[@]}${NC} mods are already up to date."
         fi
 
         # Check over key files for un-configured optional mods' .bikey files

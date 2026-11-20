@@ -53,7 +53,15 @@ keys matter here because `verifySignatures = 2`, and key filenames are often ver
 players rejected. `OPTIONALMODS_KEEP_FILES` gates the deletion; **this fork defaults it to `1`**
 where upstream would default to `0`, because keeping all 56 optional mods costs 4.8 GB here.
 
-Three smaller fixes ride along: a mod that cannot be downloaded no longer aborts the whole start,
+**The console only ever printed mod IDs.** SteamCMD's own output is ID-only, and upstream's
+messages around it are too, so a boot that touches a dozen of 131 mods gives no indication of which
+mods those were without looking each number up by hand. Every line that refers to a mod now carries
+its Workshop title alongside the ID — the update check, the download batch, the install, the failure
+list — and the mod phase ends with a summary naming what was downloaded, what was updated, and what
+the Workshop would not describe. Titles come from the same API call the update check already makes,
+so this costs no extra request; an item the API will not name still shows its ID alone.
+
+A few smaller fixes ride along: a mod that cannot be downloaded no longer aborts the whole start,
 `$BASIC_URL` becomes `$BASIC_CFG_URL` (the name the current egg actually defines, so the `basic.cfg`
 fallback stopped writing an empty file), `ModsLowercase` no longer word-splits on names containing
 spaces, and the title lookup no longer costs a second HTTP request per mod.
@@ -65,20 +73,20 @@ spaces, and the title lookup no longer costs a second HTTP request per mod.
 | `entrypoint.sh` | the script the image replaces; everything else in the image is inherited |
 | `Dockerfile` | the overlay — two lines |
 | `egg-arma3.json` | the egg, as a `PTDL_v2` export. Import it in the panel UI; the Application API is read-only for eggs |
-| `ci/build.yml` | the image build. **Move it to `.github/workflows/build.yml` to make it run** — see the note at the top of that file |
+| `.github/workflows/build.yml` | the image build, on every push to `main` |
 | `tools/repair-steamcmd-records.py` | a one-off, run per server, for any server that ran the old entrypoint |
 | `upstream.patch` | the exact diff against upstream's `games/arma3/entrypoint.sh` |
 
 ## Deploying it
 
-1. `git mv ci/build.yml .github/workflows/build.yml` and push, so the image is built and published.
-2. Make the resulting package **public** from its own settings page. Wings is configured with no
-   registry credentials, so it cannot pull a private package.
-3. Import `egg-arma3.json` in the panel, or add `ghcr.io/5ranger/5ranger-arma3:latest` to the
-   existing egg's Docker images and set it as the default.
-4. Set `OPTIONALMODS_KEEP_FILES` to `1` on each server. The entrypoint defaults to keeping the files
+The image is published and public at `ghcr.io/5ranger/5ranger-arma3:latest`, built from `main`.
+
+1. Import `egg-arma3.json` in the panel, or add `ghcr.io/5ranger/5ranger-arma3:latest` to the
+   existing egg's Docker images and set it as the default. Eggs cannot be written through the
+   Application API, so this is a panel UI step.
+2. Set `OPTIONALMODS_KEEP_FILES` to `1` on each server. The entrypoint defaults to keeping the files
    when the variable is absent, so this only matters if the egg sets it to `0`.
-5. On any server that ran the old entrypoint, stop it and run
+3. On any server that ran the old entrypoint, stop it and run
    `tools/repair-steamcmd-records.py <volume> --apply` once, then start it. Expect a long first boot:
    it refetches everything the old version had recorded as installed without files on disk.
 
